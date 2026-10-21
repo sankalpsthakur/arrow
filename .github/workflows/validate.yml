@@ -1,0 +1,139 @@
+# Fork-only validation of a small change in the C++ set lookup kernels.
+# Two variants of the same job run one after the other (max-parallel 1) so the
+# second one reuses the compiler cache of the first:
+#   with-change     the production file as committed; every test must pass
+#   without-change  the production file restored from the base commit, the new
+#                   tests kept; the new tests must FAIL BY ASSERTION
+name: validate
+
+on:
+  push:
+    branches:
+      - 'validate/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CCACHE_DIR: /home/runner/.ccache
+  CCACHE_MAXSIZE: 4G
+  PROD_FILE: cpp/src/arrow/compute/kernels/scalar_set_lookup.cc
+
+jobs:
+  cpp:
+    name: C++ ${{ matrix.variant }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 200
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        variant: [with-change, without-change]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 3
+
+      - name: History
+        run: |
+          git log --oneline -3
+          git diff --stat HEAD~2 HEAD -- "$PROD_FILE"
+          grep -c LookupKey "$PROD_FILE" || true
+
+      - name: Restore the production file from the base commit
+        if: matrix.variant == 'without-change'
+        run: |
+          git checkout HEAD~2 -- "$PROD_FILE"
+          if grep -q LookupKey "$PROD_FILE"; then echo "restore failed"; exit 1; fi
+          git status --short
+          git diff --cached --stat
+
+      - name: Check the change is present
+        if: matrix.variant == 'with-change'
+        run: grep -q LookupKey "$PROD_FILE"
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ccache ninja-build
+
+      - name: ccache
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/.ccache
+          key: ccache-cpp-${{ github.run_id }}-${{ matrix.variant }}
+          restore-keys: |
+            ccache-cpp-
+
+      - name: Configure
+        run: |
+          cmake -S cpp -B build -GNinja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DARROW_BUILD_TESTS=ON \
+            -DARROW_BUILD_INTEGRATION=OFF \
+            -DARROW_COMPUTE=ON \
+            -DARROW_CSV=ON \
+            -DARROW_JSON=ON \
+            -DARROW_FILESYSTEM=ON \
+            -DARROW_MIMALLOC=OFF \
+            -DARROW_JEMALLOC=OFF \
+            -DARROW_WITH_RE2=OFF \
+            -DARROW_WITH_UTF8PROC=OFF \
+            -DARROW_BUILD_STATIC=OFF \
+            -DARROW_DEPENDENCY_SOURCE=BUNDLED
+
+      - name: Build
+        run: |
+          cmake --build build \
+            --target arrow-compute-scalar-utility-test arrow-compute-expression-test
+          ccache -s || true
+
+      - name: New tests (with-change must pass)
+        if: matrix.variant == 'with-change'
+        run: |
+          set -x
+          ./build/debug/arrow-compute-scalar-utility-test --gtest_filter='*SignedZero*'
+          ./build/debug/arrow-compute-expression-test --gtest_filter='*SignedZero*'
+
+      - name: Neighbouring tests in full (with-change)
+        if: matrix.variant == 'with-change'
+        run: |
+          ./build/debug/arrow-compute-scalar-utility-test
+          ./build/debug/arrow-compute-expression-test
+
+      - name: New tests must fail by assertion (without-change)
+        if: matrix.variant == 'without-change'
+        run: |
+          set +e
+          ./build/debug/arrow-compute-scalar-utility-test --gtest_filter='*SignedZero*' \
+            --gtest_output=json:"$PWD/utility.json" 2>&1 | tee utility.log
+          ./build/debug/arrow-compute-expression-test --gtest_filter='*SignedZero*' \
+            --gtest_output=json:"$PWD/expression.json" 2>&1 | tee expression.log
+          set -e
+          python3 - <<'PY'
+          import json, sys
+          expected = {
+              'utility.json': {'TestIsInKernel.SignedZero', 'TestIndexInKernel.SignedZero'},
+              'expression.json': {'Expression.SimplifyIsInSignedZero'},
+          }
+          ok = True
+          for path, want in expected.items():
+              data = json.load(open(path))
+              failed, passed = set(), set()
+              for suite in data['testsuites']:
+                  for case in suite['testsuite']:
+                      name = f"{suite['name']}.{case['name']}"
+                      if case.get('failures'):
+                          failed.add(name)
+                          for f in case['failures']:
+                              print('ASSERTION FAILURE in', name)
+                              print(f['failure'][:1500])
+                      else:
+                          passed.add(name)
+              print(path, 'failed:', sorted(failed), 'passed:', sorted(passed))
+              if failed != want or passed:
+                  ok = False
+                  print('UNEXPECTED outcome in', path, 'wanted failures exactly', sorted(want))
+          sys.exit(0 if ok else 1)
+          PY
