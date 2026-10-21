@@ -1,0 +1,167 @@
+# Fork-only validation of the pyarrow-level tests for a small change in the C++
+# set lookup kernels. Same two variants as the C++ workflow (run in parallel):
+#   with-change     pyarrow built from the branch; the new tests must pass
+#   without-change  the production file restored from the base commit, libarrow_compute
+#                   rebuilt and reinstalled, the new tests kept; they must FAIL BY ASSERTION
+name: validate-python
+
+on:
+  push:
+    branches:
+      - 'validate/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CCACHE_DIR: /home/runner/.ccache
+  CCACHE_MAXSIZE: 4G
+  PROD_FILE: cpp/src/arrow/compute/kernels/scalar_set_lookup.cc
+  SETUPTOOLS_SCM_PRETEND_VERSION: 27.0.0.dev0
+
+jobs:
+  python:
+    name: pyarrow ${{ matrix.variant }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [with-change, without-change]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 3
+
+      - name: History
+        run: |
+          git log --oneline -3
+          git diff --stat HEAD~2 HEAD -- "$PROD_FILE"
+
+      - name: Restore the production file from the base commit
+        if: matrix.variant == 'without-change'
+        run: |
+          git checkout HEAD~2 -- "$PROD_FILE"
+          if grep -q LookupKey "$PROD_FILE"; then echo "restore failed"; exit 1; fi
+          git diff --cached --stat
+
+      - name: Check the change is present
+        if: matrix.variant == 'with-change'
+        run: grep -q LookupKey "$PROD_FILE"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ccache ninja-build libthrift-dev libboost-dev libsnappy-dev
+          python -m pip install --upgrade pip
+          python -m pip install numpy cython setuptools setuptools-scm pytest hypothesis pandas pytz cffi
+
+      - name: ccache
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/.ccache
+          key: ccache-py-${{ github.run_id }}-${{ matrix.variant }}
+          restore-keys: |
+            ccache-py-
+
+      - name: Build and install Arrow C++
+        run: |
+          export ARROW_HOME=$PWD/dist
+          cmake -S cpp -B build-cpp -GNinja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=$ARROW_HOME \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DARROW_PYTHON=ON \
+            -DARROW_COMPUTE=ON \
+            -DARROW_CSV=ON \
+            -DARROW_DATASET=ON \
+            -DARROW_ACERO=ON \
+            -DARROW_FILESYSTEM=ON \
+            -DARROW_JSON=ON \
+            -DARROW_PARQUET=ON \
+            -DARROW_WITH_SNAPPY=ON \
+            -DARROW_WITH_UTF8PROC=ON \
+            -DARROW_WITH_RE2=OFF \
+            -DARROW_MIMALLOC=OFF \
+            -DARROW_JEMALLOC=OFF \
+            -DARROW_BUILD_STATIC=OFF \
+            -DARROW_BUILD_TESTS=OFF
+          cmake --build build-cpp --target install
+          ccache -s || true
+
+      - name: Build pyarrow
+        run: |
+          export ARROW_HOME=$PWD/dist
+          export CMAKE_PREFIX_PATH=$ARROW_HOME
+          export LD_LIBRARY_PATH=$ARROW_HOME/lib:$LD_LIBRARY_PATH
+          cd python
+          python -m pip install -r requirements-build.txt
+          python -m pip install --no-build-isolation --editable . -vv
+          python -c "import pyarrow as pa, pyarrow.dataset, pyarrow.parquet; print(pa.__version__)"
+
+      - name: New tests (with-change must pass)
+        if: matrix.variant == 'with-change'
+        run: |
+          export ARROW_HOME=$PWD/dist
+          export LD_LIBRARY_PATH=$ARROW_HOME/lib:$LD_LIBRARY_PATH
+          cd python
+          python -m pytest -p no:cacheprovider -v -k signed_zero --junitxml=out.xml \
+            pyarrow/tests/test_compute.py pyarrow/tests/test_dataset.py
+          python - <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+          cases = list(ET.parse('out.xml').getroot().iter('testcase'))
+          names = sorted(c.get('name') for c in cases)
+          bad = [c.get('name') for c in cases
+                 if c.find('failure') is not None or c.find('error') is not None
+                 or c.find('skipped') is not None]
+          print(len(cases), 'tests ran:', names, 'not passed:', bad)
+          sys.exit(1 if (bad or len(cases) != 4) else 0)
+          PY
+
+      - name: Neighbouring tests (with-change, informational)
+        if: matrix.variant == 'with-change'
+        continue-on-error: true
+        run: |
+          export ARROW_HOME=$PWD/dist
+          export LD_LIBRARY_PATH=$ARROW_HOME/lib:$LD_LIBRARY_PATH
+          cd python
+          python -m pytest -p no:cacheprovider -q -k "is_in or index_in or isin or filter" \
+            pyarrow/tests/test_compute.py pyarrow/tests/test_dataset.py
+
+      - name: New tests must fail by assertion (without-change)
+        if: matrix.variant == 'without-change'
+        run: |
+          export ARROW_HOME=$PWD/dist
+          export LD_LIBRARY_PATH=$ARROW_HOME/lib:$LD_LIBRARY_PATH
+          cd python
+          set +e
+          python -m pytest -p no:cacheprovider -v -k signed_zero --junitxml=out.xml \
+            pyarrow/tests/test_compute.py pyarrow/tests/test_dataset.py 2>&1 | tee out.log
+          set -e
+          python - <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+          root = ET.parse('out.xml').getroot()
+          cases = list(root.iter('testcase'))
+          bad = False
+          for case in cases:
+              name = f"{case.get('classname')}::{case.get('name')}"
+              failure = case.find('failure')
+              text = ''
+              if failure is not None:
+                  text = (failure.get('message', '') or '') + (failure.text or '')
+              if failure is not None and 'assert' in text.lower():
+                  print('ASSERTION FAILURE:', name)
+                  print((failure.text or '')[:1200])
+              else:
+                  bad = True
+                  print('NOT A PLAIN ASSERTION FAILURE:', name)
+          print(len(cases), 'tests selected')
+          sys.exit(1 if (bad or len(cases) < 4) else 0)
+          PY
