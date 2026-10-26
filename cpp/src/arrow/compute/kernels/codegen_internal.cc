@@ -349,6 +349,7 @@ TypeHolder CommonTemporal(const TypeHolder* begin, size_t count) {
 
 TypeHolder CommonBinary(const TypeHolder* begin, size_t count) {
   bool all_utf8 = true, all_offset32 = true, all_fixed_width = true;
+  bool all_view = true, any_view = false;
 
   const TypeHolder* end = begin + count;
   for (auto it = begin; it != end; ++it) {
@@ -357,22 +358,38 @@ TypeHolder CommonBinary(const TypeHolder* begin, size_t count) {
     switch (id) {
       case Type::STRING:
         all_fixed_width = false;
+        all_view = false;
         continue;
       case Type::BINARY:
         all_fixed_width = false;
         all_utf8 = false;
+        all_view = false;
         continue;
       case Type::FIXED_SIZE_BINARY:
         all_utf8 = false;
+        all_view = false;
         continue;
       case Type::LARGE_STRING:
         all_offset32 = false;
         all_fixed_width = false;
+        all_view = false;
         continue;
       case Type::LARGE_BINARY:
         all_offset32 = false;
         all_fixed_width = false;
         all_utf8 = false;
+        all_view = false;
+        continue;
+      case Type::STRING_VIEW:
+        all_fixed_width = false;
+        all_offset32 = false;
+        any_view = true;
+        continue;
+      case Type::BINARY_VIEW:
+        all_fixed_width = false;
+        all_offset32 = false;
+        all_utf8 = false;
+        any_view = true;
         continue;
       default:
         return TypeHolder(nullptr);
@@ -381,6 +398,14 @@ TypeHolder CommonBinary(const TypeHolder* begin, size_t count) {
 
   if (all_fixed_width) {
     // At least for the purposes of comparison, no need to cast.
+    return TypeHolder(nullptr);
+  }
+
+  if (any_view) {
+    if (all_view) {
+      return all_utf8 ? utf8_view() : binary_view();
+    }
+    // Mix of view and offset-based binary: no common type.
     return TypeHolder(nullptr);
   }
 

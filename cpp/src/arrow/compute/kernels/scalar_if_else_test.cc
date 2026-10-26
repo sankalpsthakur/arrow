@@ -17,10 +17,14 @@
 
 #include <limits>
 #include <numeric>
+#include <optional>
+#include <string>
+#include <vector>
 
 #include <gtest/gtest.h>
 
 #include "arrow/array.h"
+#include "arrow/array/builder_binary.h"
 #include "arrow/array/concatenate.h"
 #include "arrow/compute/api_scalar.h"
 #include "arrow/compute/cast.h"
@@ -32,7 +36,26 @@
 
 namespace arrow {
 
+using internal::checked_cast;
 using internal::checked_pointer_cast;
+
+// Build a binary_view/string_view array with a small block size so out-of-line
+// values span multiple data buffers.
+Result<std::shared_ptr<Array>> MakeViewArrayWithBlockSize(
+    const std::shared_ptr<DataType>& type,
+    const std::vector<std::optional<std::string>>& values, int64_t block_size) {
+  ARROW_ASSIGN_OR_RAISE(auto builder, MakeBuilder(type));
+  auto* view_builder = checked_cast<BinaryViewBuilder*>(builder.get());
+  view_builder->SetBlockSize(block_size);
+  for (const auto& value : values) {
+    if (value.has_value()) {
+      RETURN_NOT_OK(view_builder->Append(*value));
+    } else {
+      RETURN_NOT_OK(view_builder->AppendNull());
+    }
+  }
+  return builder->Finish();
+}
 
 namespace compute {
 
@@ -77,6 +100,7 @@ using IfElseNumericBasedTypes =
     ::testing::Types<UInt32Type, FloatType, Date32Type, Time32Type, TimestampType,
                      MonthIntervalType, DurationType>;
 using BaseBinaryArrowTypes = ::testing::Types<BinaryType>;
+using BinaryViewArrowTypes = ::testing::Types<BinaryViewType>;
 using ListArrowTypes = ::testing::Types<ListType>;
 using IntegralArrowTypes = ::testing::Types<Int32Type>;
 #else
@@ -85,6 +109,7 @@ using IfElseNumericBasedTypes =
                      Int32Type, Int64Type, HalfFloatType, FloatType, DoubleType,
                      Date32Type, Date64Type, Time32Type, Time64Type, TimestampType,
                      MonthIntervalType, DurationType>;
+using BinaryViewArrowTypes = ::testing::Types<BinaryViewType, StringViewType>;
 #endif
 
 TYPED_TEST_SUITE(TestIfElsePrimitive, IfElseNumericBasedTypes);
@@ -515,6 +540,14 @@ TEST_F(TestIfElseKernel, IfElseDispatchBest) {
                     {boolean(), date64(), date64()});
   CheckDispatchBest(name, {boolean(), date32(), date32()},
                     {boolean(), date32(), date32()});
+
+  CheckDispatchBest(name, {boolean(), utf8_view(), utf8_view()},
+                    {boolean(), utf8_view(), utf8_view()});
+  CheckDispatchBest(name, {boolean(), binary_view(), binary_view()},
+                    {boolean(), binary_view(), binary_view()});
+  CheckDispatchBest(name, {boolean(), utf8_view(), binary_view()},
+                    {boolean(), binary_view(), binary_view()});
+  CheckDispatchFails(name, {boolean(), utf8(), utf8_view()});
 }
 
 template <typename Type>
@@ -658,6 +691,126 @@ TYPED_TEST(TestIfElseBaseBinary, IfElseBaseBinaryNonZeroFirst) {
   auto cond_aas = ArrayFromJSON(boolean(), "[false, true, true]");
   ASSERT_OK_AND_ASSIGN(auto result_aas,
                        CallFunction("if_else", {cond_aas, arr, MakeNullScalar(type)}));
+  ASSERT_OK(result_aas.make_array()->ValidateFull());
+  AssertArraysEqual(*expected, *result_aas.make_array(), true);
+}
+
+template <typename Type>
+class TestIfElseBinaryView : public ::testing::Test {};
+
+TYPED_TEST_SUITE(TestIfElseBinaryView, BinaryViewArrowTypes);
+
+TYPED_TEST(TestIfElseBinaryView, Basics) {
+  auto type = TypeTraits<TypeParam>::type_singleton();
+
+  CheckWithDifferentShapes(
+      ArrayFromJSON(boolean(), "[true, true, true, false]"),
+      ArrayFromJSON(type, R"(["a", "abcdefghijkl", "abcdefghijklm", "short"])"),
+      ArrayFromJSON(type,
+                    R"(["this string is definitely out of line", "tiny", "lm", "l"])"),
+      ArrayFromJSON(type, R"(["a", "abcdefghijkl", "abcdefghijklm", "l"])"));
+
+  CheckWithDifferentShapes(
+      ArrayFromJSON(boolean(), R"([true, true, true, false])"),
+      ArrayFromJSON(type, R"(["a", "abcdefghijkl", "abcdefghijklm", "short"])"),
+      ArrayFromJSON(type,
+                    R"(["this string is definitely out of line", "tiny", "lm", null])"),
+      ArrayFromJSON(type, R"(["a", "abcdefghijkl", "abcdefghijklm", null])"));
+
+  CheckWithDifferentShapes(
+      ArrayFromJSON(boolean(), R"([true, true, true, false])"),
+      ArrayFromJSON(type, R"(["a", "abcdefghijkl", null, "short"])"),
+      ArrayFromJSON(type,
+                    R"(["this string is definitely out of line", "tiny", "lm", "l"])"),
+      ArrayFromJSON(type, R"(["a", "abcdefghijkl", null, "l"])"));
+
+  CheckWithDifferentShapes(
+      ArrayFromJSON(boolean(), R"([null, true, true, false])"),
+      ArrayFromJSON(type, R"(["a", "abcdefghijkl", null, "short"])"),
+      ArrayFromJSON(type,
+                    R"(["this string is definitely out of line", "tiny", "lm", "l"])"),
+      ArrayFromJSON(type, R"([null, "abcdefghijkl", null, "l"])"));
+}
+
+TYPED_TEST(TestIfElseBinaryView, MultiBuffer) {
+  auto type = TypeTraits<TypeParam>::type_singleton();
+  // Each out-of-line value is larger than the block size, so each lands in its
+  // own data buffer.
+  ASSERT_OK_AND_ASSIGN(
+      auto left, MakeViewArrayWithBlockSize(
+                     type,
+                     {"inline", "this is out of line!!", std::nullopt,
+                      "another out-of-line string here"},
+                     /*block_size=*/16));
+  ASSERT_OK_AND_ASSIGN(
+      auto right,
+      MakeViewArrayWithBlockSize(
+          type,
+          {"tiny", "0123456789abcdef!!", "inline-ok", "yet another out-of-line value"},
+          /*block_size=*/16));
+  ASSERT_OK(left->ValidateFull());
+  ASSERT_OK(right->ValidateFull());
+  ASSERT_GT(left->data()->buffers.size(), 3);
+  ASSERT_GT(right->data()->buffers.size(), 3);
+
+  auto cond = ArrayFromJSON(boolean(), "[true, false, true, false]");
+  auto expected = ArrayFromJSON(
+      type, R"(["inline", "0123456789abcdef!!", null, "yet another out-of-line value"])");
+  CheckWithDifferentShapes(cond, left, right, expected);
+}
+
+TYPED_TEST(TestIfElseBinaryView, Random) {
+  using ArrayType = typename TypeTraits<TypeParam>::ArrayType;
+  auto type = TypeTraits<TypeParam>::type_singleton();
+
+  random::RandomArrayGenerator rand(/*seed=*/0);
+  int64_t len = 1000;
+
+  ASSERT_OK_AND_ASSIGN(auto temp1, MakeArrayFromScalar(BooleanScalar(true), 64));
+  ASSERT_OK_AND_ASSIGN(auto temp2, MakeArrayFromScalar(BooleanScalar(false), 64));
+  auto temp3 = rand.ArrayOf(boolean(), len - 64 * 2, /*null_probability=*/0.01);
+  ASSERT_OK_AND_ASSIGN(auto concat, Concatenate({temp1, temp2, temp3}));
+  auto cond = std::static_pointer_cast<BooleanArray>(concat);
+
+  auto left = std::static_pointer_cast<ArrayType>(
+      rand.ArrayOf(type, len, /*null_probability=*/0.01));
+  auto right = std::static_pointer_cast<ArrayType>(
+      rand.ArrayOf(type, len, /*null_probability=*/0.01));
+
+  typename TypeTraits<TypeParam>::BuilderType builder;
+  for (int64_t i = 0; i < len; ++i) {
+    if (!cond->IsValid(i) || (cond->Value(i) && !left->IsValid(i)) ||
+        (!cond->Value(i) && !right->IsValid(i))) {
+      ASSERT_OK(builder.AppendNull());
+      continue;
+    }
+    if (cond->Value(i)) {
+      ASSERT_OK(builder.Append(left->GetView(i)));
+    } else {
+      ASSERT_OK(builder.Append(right->GetView(i)));
+    }
+  }
+  ASSERT_OK_AND_ASSIGN(auto expected_data, builder.Finish());
+  CheckIfElseOutput(cond, left, right, expected_data);
+}
+
+TYPED_TEST(TestIfElseBinaryView, Sliced) {
+  auto type = TypeTraits<TypeParam>::type_singleton();
+
+  auto full_arr =
+      ArrayFromJSON(type, R"(["not used", null, "abcdefghijklm", "short"])");
+  auto sliced = full_arr->Slice(1);
+  auto expected = ArrayFromJSON(type, R"([null, "abcdefghijklm", "short"])");
+
+  auto cond_asa = ArrayFromJSON(boolean(), "[true, false, false]");
+  ASSERT_OK_AND_ASSIGN(auto result_asa,
+                       CallFunction("if_else", {cond_asa, MakeNullScalar(type), sliced}));
+  ASSERT_OK(result_asa.make_array()->ValidateFull());
+  AssertArraysEqual(*expected, *result_asa.make_array(), true);
+
+  auto cond_aas = ArrayFromJSON(boolean(), "[false, true, true]");
+  ASSERT_OK_AND_ASSIGN(auto result_aas,
+                       CallFunction("if_else", {cond_aas, sliced, MakeNullScalar(type)}));
   ASSERT_OK(result_aas.make_array()->ValidateFull());
   AssertArraysEqual(*expected, *result_aas.make_array(), true);
 }
@@ -2149,6 +2302,79 @@ TYPED_TEST(TestCaseWhenBinary, Random) {
 }
 
 template <typename Type>
+class TestCaseWhenBinaryView : public ::testing::Test {};
+
+TYPED_TEST_SUITE(TestCaseWhenBinaryView, BinaryViewArrowTypes);
+
+TYPED_TEST(TestCaseWhenBinaryView, Basics) {
+  auto type = default_type_instance<TypeParam>();
+  auto cond_true = ScalarFromJSON(boolean(), "true");
+  auto cond_false = ScalarFromJSON(boolean(), "false");
+  auto cond_null = ScalarFromJSON(boolean(), "null");
+  auto cond1 = ArrayFromJSON(boolean(), "[true, true, null, null]");
+  auto cond2 = ArrayFromJSON(boolean(), "[true, false, true, null]");
+  auto scalar_null = ScalarFromJSON(type, "null");
+  auto scalar1 = ScalarFromJSON(type, R"("aBxYz")");
+  auto scalar2 = ScalarFromJSON(type, R"("this is out of line")");
+  auto values_null = ArrayFromJSON(type, "[null, null, null, null]");
+  auto values1 =
+      ArrayFromJSON(type, R"(["cDE", null, "abcdefghijklm", "short"])");
+  auto values2 = ArrayFromJSON(
+      type, R"(["this string is definitely out of line", "tiny", null, "hi"])");
+
+  CheckScalar("case_when", {MakeStruct({}), values1}, values1);
+  CheckScalar("case_when", {MakeStruct({}), values_null}, values_null);
+
+  CheckScalar("case_when", {MakeStruct({cond_true}), scalar1, values1},
+              *MakeArrayFromScalar(*scalar1, 4));
+  CheckScalar("case_when", {MakeStruct({cond_false}), scalar1, values1}, values1);
+
+  CheckScalar("case_when", {MakeStruct({cond_true}), values1}, values1);
+  CheckScalar("case_when", {MakeStruct({cond_false}), values1}, values_null);
+  CheckScalar("case_when", {MakeStruct({cond_null}), values1}, values_null);
+  CheckScalar("case_when", {MakeStruct({cond_true}), values1, values2}, values1);
+  CheckScalar("case_when", {MakeStruct({cond_false}), values1, values2}, values2);
+  CheckScalar("case_when", {MakeStruct({cond_null}), values1, values2}, values2);
+
+  CheckScalar("case_when", {MakeStruct({cond1, cond2}), scalar1, scalar2},
+              ArrayFromJSON(type, R"(["aBxYz", "aBxYz", "this is out of line", null])"));
+  CheckScalar("case_when", {MakeStruct({cond1}), scalar_null, scalar1},
+              ArrayFromJSON(type, R"([null, null, "aBxYz", "aBxYz"])"));
+  CheckScalar("case_when", {MakeStruct({cond1, cond2}), values1, values2},
+              ArrayFromJSON(type, R"(["cDE", null, null, null])"));
+  CheckScalar("case_when", {MakeStruct({cond1, cond2}), values1, values2, values1},
+              ArrayFromJSON(type, R"(["cDE", null, null, "short"])"));
+}
+
+TYPED_TEST(TestCaseWhenBinaryView, MultiBuffer) {
+  auto type = default_type_instance<TypeParam>();
+  ASSERT_OK_AND_ASSIGN(
+      auto values1, MakeViewArrayWithBlockSize(
+                        type,
+                        {"inline", "this is out of line!!", std::nullopt,
+                         "another out-of-line string here"},
+                        /*block_size=*/16));
+  ASSERT_OK_AND_ASSIGN(
+      auto values2,
+      MakeViewArrayWithBlockSize(
+          type,
+          {"tiny", "0123456789abcdef!!", "inline-ok", "yet another out-of-line value"},
+          /*block_size=*/16));
+  ASSERT_GT(values1->data()->buffers.size(), 3);
+  ASSERT_GT(values2->data()->buffers.size(), 3);
+
+  auto cond1 = ArrayFromJSON(boolean(), "[true, false, true, false]");
+  auto cond2 = ArrayFromJSON(boolean(), "[false, true, false, true]");
+  CheckScalar("case_when", {MakeStruct({cond1, cond2}), values1, values2},
+              ArrayFromJSON(type, R"(["inline", "0123456789abcdef!!", null, )"
+                                  R"("yet another out-of-line value"])"));
+}
+
+TYPED_TEST(TestCaseWhenBinaryView, Random) {
+  TestCaseWhenRandom(default_type_instance<TypeParam>());
+}
+
+template <typename Type>
 class TestCaseWhenList : public ::testing::Test {};
 
 TYPED_TEST_SUITE(TestCaseWhenList, ListAndListViewArrowTypes);
@@ -2783,6 +3009,14 @@ TEST(TestCaseWhen, DispatchBest) {
   CheckDispatchBest("case_when",
                     {struct_({field("", boolean())}), binary(), large_utf8()},
                     {struct_({field("", boolean())}), large_binary(), large_binary()});
+  CheckDispatchBest("case_when",
+                    {struct_({field("", boolean())}), utf8_view(), utf8_view()},
+                    {struct_({field("", boolean())}), utf8_view(), utf8_view()});
+  CheckDispatchBest("case_when",
+                    {struct_({field("", boolean())}), utf8_view(), binary_view()},
+                    {struct_({field("", boolean())}), binary_view(), binary_view()});
+  CheckDispatchFails("case_when",
+                     {struct_({field("", boolean())}), utf8(), utf8_view()});
   CheckDispatchBest(
       "case_when",
       {struct_({field("", boolean())}), timestamp(TimeUnit::SECOND), date32()},
@@ -3037,6 +3271,65 @@ TYPED_TEST(TestCoalesceBinary, Basics) {
               ArrayFromJSON(type, R"(["klmno", "bc", "def", "ghij"])"));
   CheckScalar("coalesce", {scalar1, values1},
               ArrayFromJSON(type, R"(["a", "a", "a", "a"])"));
+}
+
+template <typename Type>
+class TestCoalesceBinaryView : public ::testing::Test {};
+
+TYPED_TEST_SUITE(TestCoalesceBinaryView, BinaryViewArrowTypes);
+
+TYPED_TEST(TestCoalesceBinaryView, Basics) {
+  auto type = default_type_instance<TypeParam>();
+  auto scalar_null = ScalarFromJSON(type, "null");
+  auto scalar1 = ScalarFromJSON(type, R"("this is out of line")");
+  auto values_null = ArrayFromJSON(type, R"([null, null, null, null])");
+  auto values1 = ArrayFromJSON(type, R"([null, "bc", "abcdefghijklm", "short"])");
+  auto values2 = ArrayFromJSON(
+      type, R"(["this string is definitely out of line", "tiny", "qr", "stu"])");
+  auto values3 = ArrayFromJSON(type, R"(["vwxy", "zabc", "d", null])");
+  CheckScalar("coalesce", {values_null}, values_null);
+  CheckScalar("coalesce", {values_null, scalar1},
+              ArrayFromJSON(type,
+                            R"(["this is out of line", "this is out of line", )"
+                            R"("this is out of line", "this is out of line"])"));
+  CheckScalar("coalesce", {values_null, values1}, values1);
+  CheckScalar("coalesce", {values1, values_null}, values1);
+  CheckScalar("coalesce", {scalar_null, values1}, values1);
+  CheckScalar("coalesce", {values1, scalar_null}, values1);
+  CheckScalar("coalesce", {values1, scalar1},
+              ArrayFromJSON(type, R"(["this is out of line", "bc", )"
+                                  R"("abcdefghijklm", "short"])"));
+  CheckScalar("coalesce", {values1, values2},
+              ArrayFromJSON(type, R"(["this string is definitely out of line", "bc", )"
+                                  R"("abcdefghijklm", "short"])"));
+  CheckScalar("coalesce", {values1, values2, values3},
+              ArrayFromJSON(type, R"(["this string is definitely out of line", "bc", )"
+                                  R"("abcdefghijklm", "short"])"));
+  CheckScalar("coalesce", {scalar1, values1},
+              ArrayFromJSON(type,
+                            R"(["this is out of line", "this is out of line", )"
+                            R"("this is out of line", "this is out of line"])"));
+}
+
+TYPED_TEST(TestCoalesceBinaryView, MultiBuffer) {
+  auto type = default_type_instance<TypeParam>();
+  ASSERT_OK_AND_ASSIGN(
+      auto values1, MakeViewArrayWithBlockSize(
+                        type,
+                        {std::nullopt, "this is out of line!!", "inline",
+                         "another out-of-line string here"},
+                        /*block_size=*/16));
+  ASSERT_OK_AND_ASSIGN(
+      auto values2,
+      MakeViewArrayWithBlockSize(
+          type,
+          {"tiny", "0123456789abcdef!!", std::nullopt, "yet another out-of-line value"},
+          /*block_size=*/16));
+  ASSERT_GT(values1->data()->buffers.size(), 3);
+  ASSERT_GT(values2->data()->buffers.size(), 3);
+  CheckScalar("coalesce", {values1, values2},
+              ArrayFromJSON(type, R"(["tiny", "this is out of line!!", "inline", )"
+                                  R"("another out-of-line string here"])"));
 }
 
 TYPED_TEST(TestCoalesceList, ListOfString) {
@@ -3690,6 +3983,10 @@ TEST(TestCoalesce, DispatchBest) {
   CheckDispatchBest("coalesce", {binary(), utf8()}, {binary(), binary()});
   CheckDispatchBest("coalesce", {binary(), large_binary()},
                     {large_binary(), large_binary()});
+  CheckDispatchBest("coalesce", {utf8_view(), utf8_view()}, {utf8_view(), utf8_view()});
+  CheckDispatchBest("coalesce", {utf8_view(), binary_view()},
+                    {binary_view(), binary_view()});
+  CheckDispatchFails("coalesce", {utf8(), utf8_view()});
   CheckDispatchBest("coalesce", {int32(), decimal128(3, 2)},
                     {decimal128(12, 2), decimal128(12, 2)});
   CheckDispatchBest("coalesce", {float32(), decimal128(3, 2)}, {float64(), float64()});
@@ -3820,6 +4117,61 @@ TYPED_TEST(TestChooseBinary, Basics) {
   auto scalar_null = ScalarFromJSON(type, "null");
   CheckScalar("choose", {ScalarFromJSON(int64(), "0"), scalar_null, values2},
               *MakeArrayOfNull(type, 5));
+}
+
+template <typename Type>
+class TestChooseBinaryView : public ::testing::Test {};
+
+TYPED_TEST_SUITE(TestChooseBinaryView, BinaryViewArrowTypes);
+
+TYPED_TEST(TestChooseBinaryView, Basics) {
+  auto type = default_type_instance<TypeParam>();
+  auto indices1 = ArrayFromJSON(int64(), "[0, 1, 0, 1, null]");
+  auto values1 =
+      ArrayFromJSON(type, R"(["a", "abcdefghijklm", null, null, "short"])");
+  auto values2 = ArrayFromJSON(
+      type, R"(["this string is definitely out of line", "tiny", null, null, "pqrstu"])");
+  auto nulls = ArrayFromJSON(type, "[null, null, null, null, null]");
+  CheckScalar("choose", {indices1, values1, values2},
+              ArrayFromJSON(type, R"(["a", "tiny", null, null, null])"));
+  CheckScalar("choose",
+              {indices1, ScalarFromJSON(type, R"("this is out of line")"), values1},
+              ArrayFromJSON(type, R"(["this is out of line", "abcdefghijklm", )"
+                                  R"("this is out of line", null, null])"));
+  CheckScalar("choose", {ScalarFromJSON(int64(), "0"), values1, values2}, values1);
+  CheckScalar("choose", {ScalarFromJSON(int64(), "1"), values1, values2}, values2);
+  CheckScalar("choose", {ScalarFromJSON(int64(), "null"), values1, values2}, nulls);
+  auto scalar1 = ScalarFromJSON(type, R"("abcdefghijklm")");
+  CheckScalar("choose", {ScalarFromJSON(int64(), "0"), scalar1, values2},
+              *MakeArrayFromScalar(*scalar1, 5));
+  CheckScalar("choose", {ScalarFromJSON(int64(), "1"), scalar1, values2}, values2);
+  auto scalar_null = ScalarFromJSON(type, "null");
+  CheckScalar("choose", {ScalarFromJSON(int64(), "0"), scalar_null, values2},
+              *MakeArrayOfNull(type, 5));
+}
+
+TYPED_TEST(TestChooseBinaryView, MultiBuffer) {
+  auto type = default_type_instance<TypeParam>();
+  ASSERT_OK_AND_ASSIGN(
+      auto values1, MakeViewArrayWithBlockSize(
+                        type,
+                        {"inline", "this is out of line!!", std::nullopt,
+                         "another out-of-line string here", "tiny"},
+                        /*block_size=*/16));
+  ASSERT_OK_AND_ASSIGN(
+      auto values2,
+      MakeViewArrayWithBlockSize(
+          type,
+          {"tiny", "0123456789abcdef!!", "inline-ok", "yet another out-of-line value",
+           "abcdefghijklm"},
+          /*block_size=*/16));
+  ASSERT_GT(values1->data()->buffers.size(), 3);
+  ASSERT_GT(values2->data()->buffers.size(), 3);
+  auto indices = ArrayFromJSON(int64(), "[0, 1, 0, 1, null]");
+  CheckScalar(
+      "choose", {indices, values1, values2},
+      ArrayFromJSON(type, R"(["inline", "0123456789abcdef!!", null, )"
+                          R"("yet another out-of-line value", null])"));
 }
 
 TEST(TestChoose, Null) {
@@ -3984,6 +4336,10 @@ TEST(TestChooseKernel, DispatchBest) {
   // Other arguments promoted separately from index
   EXPECT_EQ((std::vector<TypeHolder>{int64(), int32(), int32()}),
             Check({int8(), int32(), uint8()}));
+  EXPECT_EQ((std::vector<TypeHolder>{int64(), utf8_view()}),
+            Check({int8(), utf8_view()}));
+  EXPECT_EQ((std::vector<TypeHolder>{int64(), binary_view()}),
+            Check({int64(), binary_view()}));
 }
 
 TEST(TestChooseKernel, Errors) {
