@@ -1341,6 +1341,18 @@ void AddBinaryIfElseKernels(const std::shared_ptr<IfElseFunction>& scalar_functi
   }
 }
 
+void AddBinaryViewIfElseKernels(const std::shared_ptr<IfElseFunction>& scalar_function,
+                                const std::vector<std::shared_ptr<DataType>>& types) {
+  // Binary-view types use variadic data buffers; copy via ArrayBuilder.
+  for (auto&& type : types) {
+    ScalarKernel kernel({boolean(), type, type}, type, NestedIfElseExec::Exec);
+    kernel.null_handling = NullHandling::COMPUTED_NO_PREALLOCATE;
+    kernel.mem_allocation = MemAllocation::NO_PREALLOCATE;
+    kernel.can_write_into_slices = false;
+    DCHECK_OK(scalar_function->AddKernel(std::move(kernel)));
+  }
+}
+
 template <typename T>
 void AddFixedWidthIfElseKernel(const std::shared_ptr<IfElseFunction>& scalar_function) {
   auto type_id = T::type_id;
@@ -1899,6 +1911,19 @@ struct CaseWhenFunctor<Type, enable_if_list_view<Type>> {
 // No-op reserve function, pulled out to avoid apparent miscompilation on MinGW
 Status ReserveNoData(ArrayBuilder*) { return Status::OK(); }
 
+template <typename Type>
+struct CaseWhenFunctor<Type, enable_if_binary_view_like<Type>> {
+  static Status Exec(KernelContext* ctx, const ExecSpan& batch, ExecResult* out) {
+    if (batch[0].null_count() > 0) {
+      return Status::Invalid("cond struct must not have outer nulls");
+    }
+    if (batch[0].is_scalar()) {
+      return ExecVarWidthScalarCaseWhen(ctx, batch, out);
+    }
+    return ExecVarWidthArrayCaseWhen(ctx, batch, out, ReserveNoData);
+  }
+};
+
 template <>
 struct CaseWhenFunctor<MapType> {
   static Status Exec(KernelContext* ctx, const ExecSpan& batch, ExecResult* out) {
@@ -2434,6 +2459,13 @@ struct CoalesceFunctor<Type, enable_if_base_binary<Type>> {
 };
 
 template <typename Type>
+struct CoalesceFunctor<Type, enable_if_binary_view_like<Type>> {
+  static Status Exec(KernelContext* ctx, const ExecSpan& batch, ExecResult* out) {
+    return ExecVarWidthCoalesce(ctx, batch, out, ReserveNoData);
+  }
+};
+
+template <typename Type>
 struct CoalesceFunctor<
     Type, enable_if_t<(is_nested_type<Type>::value || is_dictionary_type<Type>::value) &&
                       !is_union_type<Type>::value>> {
@@ -2699,6 +2731,73 @@ struct ChooseFunctor<Type, enable_if_base_binary<Type>> {
   }
 };
 
+template <typename Type>
+struct ChooseFunctor<Type, enable_if_binary_view_like<Type>> {
+  static Status Exec(KernelContext* ctx, const ExecSpan& batch, ExecResult* out) {
+    if (batch[0].is_scalar()) {
+      const Scalar& index_scalar = *batch[0].scalar;
+      if (!index_scalar.is_valid) {
+        if (out->is_array_data()) {
+          ARROW_ASSIGN_OR_RAISE(std::shared_ptr<Array> temp_array,
+                                MakeArrayOfNull(out->type()->GetSharedPtr(), batch.length,
+                                                ctx->memory_pool()));
+          out->value = std::move(temp_array->data());
+        }
+        return Status::OK();
+      }
+      auto index = UnboxScalar<Int64Type>::Unbox(index_scalar);
+      if (index < 0 || (index + 1) >= batch.num_values()) {
+        return Status::IndexError("choose: index ", index, " out of range");
+      }
+      const ExecValue& source = batch.values[index + 1];
+      if (source.is_scalar()) {
+        ARROW_ASSIGN_OR_RAISE(
+            std::shared_ptr<Array> temp_array,
+            MakeArrayFromScalar(*source.scalar, batch.length, ctx->memory_pool()));
+        out->value = std::move(temp_array->data());
+      } else {
+        DCHECK(out->is_array_data());
+        out->value = source.array.ToArrayData();
+      }
+      return Status::OK();
+    }
+
+    std::unique_ptr<ArrayBuilder> builder;
+    RETURN_NOT_OK(MakeBuilderExactIndex(ctx->memory_pool(), out->type()->GetSharedPtr(),
+                                        &builder));
+    RETURN_NOT_OK(builder->Reserve(batch.length));
+    int64_t row = 0;
+    RETURN_NOT_OK(VisitArrayValuesInline<Int64Type>(
+        batch[0].array,
+        [&](int64_t index) {
+          if (index < 0 || static_cast<size_t>(index + 1) >= batch.values.size()) {
+            return Status::IndexError("choose: index ", index, " out of range");
+          }
+          return CopyValue(batch.values[index + 1], builder.get(), row++);
+        },
+        [&]() {
+          row++;
+          return builder->AppendNull();
+        }));
+    ARROW_ASSIGN_OR_RAISE(auto temp_output, builder->Finish());
+    out->value = std::move(temp_output->data());
+    return Status::OK();
+  }
+
+  static Status CopyValue(const ExecValue& value, ArrayBuilder* builder, int64_t row) {
+    if (value.is_scalar()) {
+      if (!value.scalar->is_valid) return builder->AppendNull();
+      return builder->AppendScalar(*value.scalar);
+    }
+    const ArraySpan& source = value.array;
+    if (!source.MayHaveNulls() ||
+        bit_util::GetBit(source.buffers[0].data, source.offset + row)) {
+      return builder->AppendArraySlice(source, row, /*length=*/1);
+    }
+    return builder->AppendNull();
+  }
+};
+
 struct ChooseFunction : ScalarFunction {
   using ScalarFunction::ScalarFunction;
 
@@ -2755,6 +2854,16 @@ void AddBinaryCaseWhenKernels(const std::shared_ptr<CaseWhenFunction>& scalar_fu
                               const std::shared_ptr<MatchConstraint>& constraint) {
   for (auto&& type : types) {
     auto exec = GenerateTypeAgnosticVarBinaryBase<CaseWhenFunctor>(*type);
+    AddCaseWhenKernel(scalar_function, type, std::move(exec), constraint);
+  }
+}
+
+void AddBinaryViewCaseWhenKernels(
+    const std::shared_ptr<CaseWhenFunction>& scalar_function,
+    const std::vector<std::shared_ptr<DataType>>& types,
+    const std::shared_ptr<MatchConstraint>& constraint) {
+  for (auto&& type : types) {
+    auto exec = GenerateTypeAgnosticVarBinaryViewBase<CaseWhenFunctor>(*type);
     AddCaseWhenKernel(scalar_function, type, std::move(exec), constraint);
   }
 }
@@ -2891,6 +3000,7 @@ void RegisterScalarIfElse(FunctionRegistry* registry) {
     AddPrimitiveIfElseKernels(func, {boolean(), float16()});
     AddNullIfElseKernel(func);
     AddBinaryIfElseKernels(func, BaseBinaryTypes());
+    AddBinaryViewIfElseKernels(func, BinaryViewTypes());
     AddFixedWidthIfElseKernel<FixedSizeBinaryType>(func);
     AddFixedWidthIfElseKernel<Decimal128Type>(func);
     AddFixedWidthIfElseKernel<Decimal256Type>(func);
@@ -2914,6 +3024,7 @@ void RegisterScalarIfElse(FunctionRegistry* registry) {
     AddCaseWhenKernel(func, Type::DECIMAL256, CaseWhenFunctor<FixedSizeBinaryType>::Exec,
                       all_value_types_match);
     AddBinaryCaseWhenKernels(func, BaseBinaryTypes(), all_value_types_match);
+    AddBinaryViewCaseWhenKernels(func, BinaryViewTypes(), all_value_types_match);
     AddNestedCaseWhenKernels(func, all_value_types_match);
     DCHECK_OK(registry->AddFunction(std::move(func)));
   }
@@ -2934,6 +3045,10 @@ void RegisterScalarIfElse(FunctionRegistry* registry) {
     for (const auto& ty : BaseBinaryTypes()) {
       AddCoalesceKernel(func, ty, GenerateTypeAgnosticVarBinaryBase<CoalesceFunctor>(ty));
     }
+    for (const auto& ty : BinaryViewTypes()) {
+      AddCoalesceKernel(func, ty,
+                        GenerateTypeAgnosticVarBinaryViewBase<CoalesceFunctor>(ty));
+    }
     AddNestedCoalesceKernels(func);
     DCHECK_OK(registry->AddFunction(std::move(func)));
   }
@@ -2951,6 +3066,9 @@ void RegisterScalarIfElse(FunctionRegistry* registry) {
     AddChooseKernel(func, Type::DECIMAL256, ChooseFunctor<FixedSizeBinaryType>::Exec);
     for (const auto& ty : BaseBinaryTypes()) {
       AddChooseKernel(func, ty, GenerateTypeAgnosticVarBinaryBase<ChooseFunctor>(ty));
+    }
+    for (const auto& ty : BinaryViewTypes()) {
+      AddChooseKernel(func, ty, GenerateTypeAgnosticVarBinaryViewBase<ChooseFunctor>(ty));
     }
     DCHECK_OK(registry->AddFunction(std::move(func)));
   }
